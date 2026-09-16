@@ -25,17 +25,15 @@ const TOKEN_OUT = "0x89B38c7414EC86Eb2cB003c6362cf010B562FF1e"; // INSDR Token
 // ==========================================
 // 3. PARAMETER AUTOMASI & PENGACAKAN
 // ==========================================
-// Parameter Swap
 const MIN_SWAP_AMOUNT = "0.0005"; 
 const MAX_SWAP_AMOUNT = "0.0015"; 
-const MIN_SWAP_DELAY_MS = 45000; // 45 detik
-const MAX_SWAP_DELAY_MS = 90000; // 1.5 menit
+const MIN_SWAP_DELAY_MS = 45000; 
+const MAX_SWAP_DELAY_MS = 90000; 
 const SLIPPAGE_PERCENTAGE = 5; 
 
-// Parameter Bridge
 const MIN_BRIDGE_AMOUNT = "0.01"; 
 const MAX_BRIDGE_AMOUNT = "0.02";
-const BRIDGE_WAIT_MS = 180000; // 3 Menit waktu tunggu setelah bridge
+const BRIDGE_WAIT_MS = 180000; 
 
 // ==========================================
 // 4. SETUP PROVIDER & WALLET
@@ -69,7 +67,32 @@ function getRandomDelay(min, max) {
 }
 
 // ==========================================
-// 5. MODUL 1: FUNGSI BRIDGE
+// 5. HELPER: ANTI-RPC RATE LIMIT (AUTO-RETRY)
+// ==========================================
+async function getSafeNonce(walletAddress) {
+    while (true) {
+        try {
+            return await providerGiwa.getTransactionCount(walletAddress, "latest");
+        } catch (error) {
+            console.log(`[RPC LIMIT] Failed to get Nonce (Rate Limit). Retrying in 5 seconds...`);
+            await sleep(5000);
+        }
+    }
+}
+
+async function getSafeBalance(walletAddress) {
+    while (true) {
+        try {
+            return await providerGiwa.getBalance(walletAddress);
+        } catch (error) {
+            console.log(`[RPC LIMIT] Failed to get Balance (Rate Limit). Retrying in 5 seconds...`);
+            await sleep(5000);
+        }
+    }
+}
+
+// ==========================================
+// 6. MODUL 1: FUNGSI BRIDGE
 // ==========================================
 async function bridgeEthToGiwa(amountEth) {
     try {
@@ -92,27 +115,44 @@ async function bridgeEthToGiwa(amountEth) {
     }
 }
 
-async function startAutoBridge() {
-    console.log(`\n=== 🚀 STARTING AUTO BRIDGE MODULE ===`);
-    let counter = 1;
+async function startAutoBridge(txCount) {
+    console.log(`\n=== 🚀 STARTING AUTO BRIDGE MODULE (${txCount} TRANSACTIONS) ===`);
 
-    while (true) {
-        console.log(`--- BRIDGE ITERATION #${counter} ---`);
+    for (let counter = 1; counter <= txCount; counter++) {
+        console.log(`--- BRIDGE ITERATION #${counter} / ${txCount} ---`);
         const currentBridgeAmount = getRandomAmount(MIN_BRIDGE_AMOUNT, MAX_BRIDGE_AMOUNT);
         await bridgeEthToGiwa(currentBridgeAmount);
-        counter++;
+        
+        // Hanya delay jika bukan transaksi terakhir
+        if (counter < txCount) {
+            const currentDelayMs = getRandomDelay(MIN_SWAP_DELAY_MS, MAX_SWAP_DELAY_MS);
+            console.log(`[WAIT] Cooldown: Waiting for ${currentDelayMs / 1000} seconds...\n`);
+            await sleep(currentDelayMs);
+        }
     }
+    console.log(`\n🎉 All ${txCount} Bridge transactions completed successfully! Exiting...`);
 }
 
 // ==========================================
-// 6. MODUL 2: FUNGSI SWAP
+// 7. MODUL 2: FUNGSI SWAP
 // ==========================================
 async function swapEthForToken(ethAmount, currentNonce) {
     try {
         console.log(`[INFO] Executing swap ${ethAmount} ETH to INSDR... (Nonce: ${currentNonce})`);
 
         const amountIn = ethers.parseEther(ethAmount.toString());
-        const wethAddress = await routerContract.WETH();
+        
+        let wethAddress;
+        while(true) {
+            try {
+                wethAddress = await routerContract.WETH();
+                break;
+            } catch (e) {
+                console.log(`[RPC LIMIT] Retrying WETH fetch...`);
+                await sleep(5000);
+            }
+        }
+        
         const path = [wethAddress, TOKEN_OUT];
         
         let expectedTokenOut;
@@ -120,7 +160,7 @@ async function swapEthForToken(ethAmount, currentNonce) {
             const amountsOut = await routerContract.getAmountsOut(amountIn, path);
             expectedTokenOut = amountsOut[1]; 
         } catch (priceError) {
-            console.log(`[WARNING] Failed to fetch price. The Liquidity Pool (ETH-INSDR) might be empty or token address is wrong.`);
+            console.log(`[WARNING] Failed to fetch price. Pool might be empty or over rate limit.`);
             return false;
         }
         
@@ -141,26 +181,24 @@ async function swapEthForToken(ethAmount, currentNonce) {
 
         return true;
     } catch (error) {
-        console.error("[ERROR] Swap failed:", error.reason || "Connection/RPC Issue");
+        console.error("[ERROR] Swap failed:", error.reason || error.message);
         return false;
     }
 }
 
-async function startAutoSwap() {
-    console.log(`\n=== 🚀 STARTING AUTO SWAP MODULE ===`);
+async function startAutoSwap(txCount) {
+    console.log(`\n=== 🚀 STARTING AUTO SWAP MODULE (${txCount} TRANSACTIONS) ===`);
     console.log(`Wallet       : ${walletGiwa.address}`);
     console.log(`Swap Amount  : Random between ${MIN_SWAP_AMOUNT} - ${MAX_SWAP_AMOUNT} ETH`);
     
-    let counter = 1;
-    let nonce = await providerGiwa.getTransactionCount(walletGiwa.address, "latest");
+    let nonce = await getSafeNonce(walletGiwa.address);
 
-    while (true) {
-        console.log(`--- SWAP ITERATION #${counter} ---`);
+    for (let counter = 1; counter <= txCount; counter++) {
+        console.log(`--- SWAP ITERATION #${counter} / ${txCount} ---`);
         
-        const currentBalance = await providerGiwa.getBalance(walletGiwa.address);
+        const currentBalance = await getSafeBalance(walletGiwa.address);
         console.log(`[BALANCE] Current Giwa Balance: ${ethers.formatEther(currentBalance)} ETH`);
 
-        // Hentikan jika saldo kurang dari jumlah swap
         if (currentBalance < ethers.parseEther(MAX_SWAP_AMOUNT)) {
             console.log(`[ALERT] Insufficient balance for swap! Please bridge some ETH first.`);
             process.exit(0);
@@ -172,24 +210,46 @@ async function startAutoSwap() {
         if (swapSuccess) {
             nonce++; 
         } else {
-            nonce = await providerGiwa.getTransactionCount(walletGiwa.address, "latest");
+            nonce = await getSafeNonce(walletGiwa.address);
         }
         
-        const currentDelayMs = getRandomDelay(MIN_SWAP_DELAY_MS, MAX_SWAP_DELAY_MS);
-        console.log(`[WAIT] Anti-Bot Cooldown: Waiting for ${currentDelayMs / 1000} seconds...\n`);
-        
-        await sleep(currentDelayMs);
-        counter++;
+        // Hanya delay jika bukan transaksi terakhir
+        if (counter < txCount) {
+            const currentDelayMs = getRandomDelay(MIN_SWAP_DELAY_MS, MAX_SWAP_DELAY_MS);
+            console.log(`[WAIT] Anti-Bot Cooldown: Waiting for ${currentDelayMs / 1000} seconds...\n`);
+            await sleep(currentDelayMs);
+        }
     }
+    console.log(`\n🎉 All ${txCount} Swap transactions completed successfully! Exiting...`);
 }
 
 // ==========================================
-// 7. MENU INTERAKTIF CLI
+// 8. MENU INTERAKTIF CLI
 // ==========================================
 const rl = readline.createInterface({
     input: process.stdin,
     output: process.stdout
 });
+
+function askTransactionCount(choice) {
+    rl.question(`🔢 How many transactions do you want to run? `, async (countInput) => {
+        const txCount = parseInt(countInput);
+        
+        if (isNaN(txCount) || txCount <= 0) {
+            console.log(`❌ Invalid number. Please enter a valid positive number (e.g., 5).`);
+            rl.close();
+            process.exit(0);
+        }
+
+        rl.close(); // Tutup input setelah menerima angka yang valid
+
+        if (choice === '1') {
+            await startAutoBridge(txCount);
+        } else if (choice === '2') {
+            await startAutoSwap(txCount);
+        }
+    });
+}
 
 function showMenu() {
     console.log(`\n==============================================`);
@@ -199,13 +259,10 @@ function showMenu() {
     console.log(`   1. Bridge Sepolia 🔁 Giwa Testnet`);
     console.log(`   2. Swap ETH 🔁 Token (Giwa DEX)\n`);
     
-    rl.question(`👉 Enter your choice (1 or 2): `, async (choice) => {
-        if (choice === '1') {
-            rl.close();
-            await startAutoBridge();
-        } else if (choice === '2') {
-            rl.close();
-            await startAutoSwap();
+    rl.question(`👉 Enter your choice (1 or 2): `, (choice) => {
+        if (choice === '1' || choice === '2') {
+            // Jika pilihan valid (1 atau 2), lanjut tanya jumlah transaksi
+            askTransactionCount(choice);
         } else {
             console.log(`❌ Invalid choice. Please enter 1 or 2.`);
             rl.close();
@@ -214,5 +271,4 @@ function showMenu() {
     });
 }
 
-// Jalankan Menu
 showMenu();
