@@ -1,5 +1,6 @@
 require("dotenv").config();
 const { ethers } = require("ethers");
+const readline = require("readline");
 
 // ==========================================
 // 1. KONFIGURASI JARINGAN & WALLET
@@ -7,7 +8,7 @@ const { ethers } = require("ethers");
 const PRIVATE_KEY = process.env.PRIVATE_KEY;
 
 if (!PRIVATE_KEY) {
-    console.error("[FATAL ERROR] PRIVATE_KEY tidak ditemukan! Pastikan file .env sudah dibuat dan diisi.");
+    console.error("[FATAL ERROR] PRIVATE_KEY not found! Please check your .env file.");
     process.exit(1);
 }
 
@@ -19,24 +20,22 @@ const RPC_URL_GIWA = "https://sepolia-rpc.giwa.io";
 // ==========================================
 const L1_BRIDGE_ADDRESS = "0x956962c34687a954e611a83619abaa37ce6bc78a"; 
 const ROUTER_ADDRESS = "0xad153c844ccac3d2ea991170624200e54730be74"; 
-const TOKEN_OUT = "0x89B38c7414EC86Eb2cB003c6362cf010B562FF1e"; 
+const TOKEN_OUT = "0x89B38c7414EC86Eb2cB003c6362cf010B562FF1e"; // INSDR Token
 
 // ==========================================
-// 3. PARAMETER AUTOMASI & PENGACAKAN (RANDOMNESS)
+// 3. PARAMETER AUTOMASI & PENGACAKAN
 // ==========================================
-const MIN_GIWA_BALANCE_ETH = "0.005"; 
-const BRIDGE_AMOUNT_ETH = "0.01";     
-const BRIDGE_WAIT_MS = 180000;        // 3 menit waktu tunggu bridge
-
-const SLIPPAGE_PERCENTAGE = 5; 
-
-// [UPDATE] Rentang Acak Swap (ETH)
+// Parameter Swap
 const MIN_SWAP_AMOUNT = "0.0005"; 
 const MAX_SWAP_AMOUNT = "0.0015"; 
+const MIN_SWAP_DELAY_MS = 45000; // 45 detik
+const MAX_SWAP_DELAY_MS = 90000; // 1.5 menit
+const SLIPPAGE_PERCENTAGE = 5; 
 
-// [UPDATE] Rentang Acak Delay antar swap (Milidetik)
-const MIN_DELAY_MS = 45000; // 45 detik
-const MAX_DELAY_MS = 90000; // 1.5 menit
+// Parameter Bridge
+const MIN_BRIDGE_AMOUNT = "0.01"; 
+const MAX_BRIDGE_AMOUNT = "0.02";
+const BRIDGE_WAIT_MS = 180000; // 3 Menit waktu tunggu setelah bridge
 
 // ==========================================
 // 4. SETUP PROVIDER & WALLET
@@ -59,55 +58,71 @@ const routerContract = new ethers.Contract(ROUTER_ADDRESS, routerAbi, walletGiwa
 
 const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
-// Helper: Acak Jumlah ETH
 function getRandomAmount(min, max) {
     const minF = parseFloat(min);
     const maxF = parseFloat(max);
     return (Math.random() * (maxF - minF) + minF).toFixed(5);
 }
 
-// Helper: Acak Waktu (ms)
 function getRandomDelay(min, max) {
     return Math.floor(Math.random() * (max - min + 1)) + min;
 }
 
 // ==========================================
-// 5. FUNGSI BRIDGE (SEPOLIA -> GIWA)
+// 5. MODUL 1: FUNGSI BRIDGE
 // ==========================================
 async function bridgeEthToGiwa(amountEth) {
     try {
-        console.log(`\n[BRIDGE] Memulai bridge ${amountEth} ETH dari Sepolia ke Giwa...`);
+        console.log(`\n[BRIDGE] Starting bridge ${amountEth} ETH from Sepolia to Giwa...`);
         const amountInWei = ethers.parseEther(amountEth.toString());
         
-        console.log(`[BRIDGE] Mengirim transaksi ke jaringan Sepolia L1...`);
+        console.log(`[BRIDGE] Sending transaction to Sepolia L1...`);
         const tx = await bridgeContract.depositETH(200000, "0x", { value: amountInWei });
 
-        console.log(`[WAIT] Transaksi bridge L1 terkirim. Hash: ${tx.hash}`);
+        console.log(`[WAIT] L1 Bridge TX sent. Hash: ${tx.hash}`);
         const receipt = await tx.wait();
-        console.log(`[SUCCESS] Bridge L1 terkonfirmasi di Block: ${receipt.blockNumber}`);
-        console.log(`[WAIT] Menunggu ~${BRIDGE_WAIT_MS / 60000} menit agar ETH mendarat di jaringan Giwa L2...`);
+        console.log(`[SUCCESS] Bridge L1 Confirmed at Block: ${receipt.blockNumber}`);
+        console.log(`[WAIT] Waiting ~${BRIDGE_WAIT_MS / 60000} minutes for ETH to arrive on Giwa L2...\n`);
         
         await sleep(BRIDGE_WAIT_MS);
         return true;
     } catch (error) {
-        console.error("[ERROR] Gagal eksekusi bridge:", error.reason || error.message);
+        console.error("[ERROR] Bridge failed:", error.reason || error.message);
         return false;
     }
 }
 
+async function startAutoBridge() {
+    console.log(`\n=== 🚀 STARTING AUTO BRIDGE MODULE ===`);
+    let counter = 1;
+
+    while (true) {
+        console.log(`--- BRIDGE ITERATION #${counter} ---`);
+        const currentBridgeAmount = getRandomAmount(MIN_BRIDGE_AMOUNT, MAX_BRIDGE_AMOUNT);
+        await bridgeEthToGiwa(currentBridgeAmount);
+        counter++;
+    }
+}
+
 // ==========================================
-// 6. FUNGSI SWAP (GIWA DEX)
+// 6. MODUL 2: FUNGSI SWAP
 // ==========================================
 async function swapEthForToken(ethAmount, currentNonce) {
     try {
-        console.log(`[INFO] Eksekusi swap ${ethAmount} ETH ke INSDR... (Nonce: ${currentNonce})`);
+        console.log(`[INFO] Executing swap ${ethAmount} ETH to INSDR... (Nonce: ${currentNonce})`);
 
         const amountIn = ethers.parseEther(ethAmount.toString());
         const wethAddress = await routerContract.WETH();
         const path = [wethAddress, TOKEN_OUT];
         
-        const amountsOut = await routerContract.getAmountsOut(amountIn, path);
-        const expectedTokenOut = amountsOut[1]; 
+        let expectedTokenOut;
+        try {
+            const amountsOut = await routerContract.getAmountsOut(amountIn, path);
+            expectedTokenOut = amountsOut[1]; 
+        } catch (priceError) {
+            console.log(`[WARNING] Failed to fetch price. The Liquidity Pool (ETH-INSDR) might be empty or token address is wrong.`);
+            return false;
+        }
         
         const slippage = BigInt(SLIPPAGE_PERCENTAGE);
         const amountOutMin = (expectedTokenOut * (100n - slippage)) / 100n;
@@ -120,52 +135,37 @@ async function swapEthForToken(ethAmount, currentNonce) {
             { value: amountIn, nonce: currentNonce }
         );
 
-        console.log(`[WAIT] Transaksi Swap di-broadcast. Hash: ${tx.hash}`);
+        console.log(`[WAIT] Swap TX broadcasted. Hash: ${tx.hash}`);
         await tx.wait();
-        console.log(`[SUCCESS] Swap Berhasil!\n`);
+        console.log(`[SUCCESS] Swap Successful!\n`);
 
         return true;
     } catch (error) {
-        console.error("[ERROR] Gagal eksekusi swap:", error.reason || error.message);
+        console.error("[ERROR] Swap failed:", error.reason || "Connection/RPC Issue");
         return false;
     }
 }
 
-// ==========================================
-// 7. CORE AUTOMATION LOOP
-// ==========================================
-async function startAutoBot() {
-    console.log(`\n=== MEMULAI BOT AUTO BRIDGE & SWAP GIWA (ANTI-SYBIL MODE) ===`);
+async function startAutoSwap() {
+    console.log(`\n=== 🚀 STARTING AUTO SWAP MODULE ===`);
     console.log(`Wallet       : ${walletGiwa.address}`);
-    console.log(`Swap Amount  : Random antara ${MIN_SWAP_AMOUNT} - ${MAX_SWAP_AMOUNT} ETH`);
-    console.log(`Delay Swap   : Random antara ${MIN_DELAY_MS/1000} - ${MAX_DELAY_MS/1000} detik\n`);
+    console.log(`Swap Amount  : Random between ${MIN_SWAP_AMOUNT} - ${MAX_SWAP_AMOUNT} ETH`);
     
     let counter = 1;
     let nonce = await providerGiwa.getTransactionCount(walletGiwa.address, "latest");
-    const minBalanceWei = ethers.parseEther(MIN_GIWA_BALANCE_ETH);
 
     while (true) {
-        console.log(`--- ITERASI KE-${counter} ---`);
+        console.log(`--- SWAP ITERATION #${counter} ---`);
         
         const currentBalance = await providerGiwa.getBalance(walletGiwa.address);
-        console.log(`[SALDO] Saldo Giwa saat ini: ${ethers.formatEther(currentBalance)} ETH`);
+        console.log(`[BALANCE] Current Giwa Balance: ${ethers.formatEther(currentBalance)} ETH`);
 
-        if (currentBalance < minBalanceWei) {
-            console.log(`[ALERT] Saldo di bawah batas minimum (${MIN_GIWA_BALANCE_ETH} ETH). Memicu Auto-Bridge!`);
-            const bridgeSuccess = await bridgeEthToGiwa(BRIDGE_AMOUNT_ETH);
-            
-            if (bridgeSuccess) {
-                nonce = await providerGiwa.getTransactionCount(walletGiwa.address, "latest");
-                console.log(`[SALDO] Mengecek ulang saldo Giwa setelah bridge...`);
-                continue; 
-            } else {
-                console.log(`[WARNING] Bridge gagal, jeda sebentar sebelum mencoba lagi...`);
-                await sleep(60000); // Tunggu 1 menit jika bridge error
-                continue;
-            }
+        // Hentikan jika saldo kurang dari jumlah swap
+        if (currentBalance < ethers.parseEther(MAX_SWAP_AMOUNT)) {
+            console.log(`[ALERT] Insufficient balance for swap! Please bridge some ETH first.`);
+            process.exit(0);
         }
         
-        // [UPDATE] Generate angka acak untuk swap iterasi ini
         const currentSwapAmount = getRandomAmount(MIN_SWAP_AMOUNT, MAX_SWAP_AMOUNT);
         const swapSuccess = await swapEthForToken(currentSwapAmount, nonce);
         
@@ -175,13 +175,44 @@ async function startAutoBot() {
             nonce = await providerGiwa.getTransactionCount(walletGiwa.address, "latest");
         }
         
-        // [UPDATE] Generate jeda waktu acak untuk iterasi ini
-        const currentDelayMs = getRandomDelay(MIN_DELAY_MS, MAX_DELAY_MS);
-        console.log(`[WAIT] Anti-Bot Cooldown: Menunggu ${currentDelayMs / 1000} detik...\n`);
+        const currentDelayMs = getRandomDelay(MIN_SWAP_DELAY_MS, MAX_SWAP_DELAY_MS);
+        console.log(`[WAIT] Anti-Bot Cooldown: Waiting for ${currentDelayMs / 1000} seconds...\n`);
         
         await sleep(currentDelayMs);
         counter++;
     }
 }
 
-startAutoBot();
+// ==========================================
+// 7. MENU INTERAKTIF CLI
+// ==========================================
+const rl = readline.createInterface({
+    input: process.stdin,
+    output: process.stdout
+});
+
+function showMenu() {
+    console.log(`\n==============================================`);
+    console.log(`🤖 GIWA TESTNET AUTOMATION BOT`);
+    console.log(`==============================================`);
+    console.log(`🌐 Choose the on-chain interaction you want to run:\n`);
+    console.log(`   1. Bridge Sepolia 🔁 Giwa Testnet`);
+    console.log(`   2. Swap ETH 🔁 Token (Giwa DEX)\n`);
+    
+    rl.question(`👉 Enter your choice (1 or 2): `, async (choice) => {
+        if (choice === '1') {
+            rl.close();
+            await startAutoBridge();
+        } else if (choice === '2') {
+            rl.close();
+            await startAutoSwap();
+        } else {
+            console.log(`❌ Invalid choice. Please enter 1 or 2.`);
+            rl.close();
+            process.exit(0);
+        }
+    });
+}
+
+// Jalankan Menu
+showMenu();
